@@ -40,6 +40,21 @@ _RESUME_PAGE_SIZE = 8
 _NOT_AUTHORIZED_TEXT = "\u26D4 У вас нет доступа к этой панели."
 
 
+async def _safe_edit(query, text: str, **kwargs):
+    """edit_message_text wrapper: Telegram raises BadRequest("Message is not
+    modified") when the new text+markup are byte-identical to the current
+    message (e.g. tapping the same screen twice, or a "Отправлено: /status"
+    confirmation re-shown after a second tap) — harmless, not a real error,
+    but an uncaught raise crashes the whole callback handler. Swallow only
+    that exact case; anything else re-raises."""
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except Exception as exc:
+        if "not modified" in str(exc).lower():
+            return
+        raise
+
+
 def _resume_page_keyboard(rows: list[SessionRow], page: int, *, inline_mode: bool = False):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
@@ -135,9 +150,9 @@ def register(ctx):
 
         async def _render_root(update: Update, *, edit: bool):
             text = root_text(session_title=None, model_hint=None)
-            kb = root_keyboard()
+            kb = root_keyboard(inline_mode=inline_mode)
             if edit and update.callback_query:
-                await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+                await _safe_edit(update.callback_query, text, parse_mode="Markdown", reply_markup=kb)
             else:
                 await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -145,7 +160,7 @@ def register(ctx):
             text = screen_text(screen_id)
             kb = screen_keyboard(screen_id)
             if edit and update.callback_query:
-                await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+                await _safe_edit(update.callback_query, text, parse_mode="Markdown", reply_markup=kb)
             else:
                 await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -155,7 +170,7 @@ def register(ctx):
                 # All-inline: safe commands execute directly via adapter.handle_message()
                 # bypass (flows/direct_execute.py); destructive ones still gate through confirm.
                 if update.callback_query:
-                    await update.callback_query.edit_message_text(
+                    await _safe_edit(update.callback_query, 
                         f"{emoji} *{title}*", parse_mode="Markdown",
                         reply_markup=commands_inline_keyboard(screen_id),
                     )
@@ -164,7 +179,7 @@ def register(ctx):
             # Inline part: edit the panel message — nav back + "Подтвердить" gates
             # for any destructive command on this screen.
             if update.callback_query:
-                await update.callback_query.edit_message_text(
+                await _safe_edit(update.callback_query, 
                     f"{emoji} *{title}* \u2014 кнопки команд ниже \U0001F447",
                     parse_mode="Markdown", reply_markup=cmdlist_back_keyboard(screen_id, confirm_specs),
                 )
@@ -186,38 +201,38 @@ def register(ctx):
                     idx = -1
                 rows = list_telegram_sessions(limit=50)
                 if idx < 0 or idx >= len(rows):
-                    await query.edit_message_text("\u26A0\uFE0F Сессия устарела.", reply_markup=root_keyboard())
+                    await _safe_edit(query, "\u26A0\uFE0F Сессия устарела.", reply_markup=root_keyboard(inline_mode=inline_mode))
                     return
                 safe_title = rows[idx].title.replace('"', '\\"')
                 ok = await execute_as_if_typed(adapter, update, f'/resume "{safe_title}"')
                 label = rows[idx].title
                 if not ok:
-                    await query.edit_message_text(f"\u26A0\uFE0F Не удалось открыть «{label}».", reply_markup=root_keyboard())
+                    await _safe_edit(query, f"\u26A0\uFE0F Не удалось открыть «{label}».", reply_markup=root_keyboard(inline_mode=inline_mode))
                     return
-                await query.edit_message_text(f"\u2705 Открываю: {label}", reply_markup=root_keyboard())
+                await _safe_edit(query, f"\u2705 Открываю: {label}", reply_markup=root_keyboard(inline_mode=inline_mode))
                 return
             spec = BY_NAME.get(command_name)
             if spec is None:
-                await query.edit_message_text("\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard())
+                await _safe_edit(query, "\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard(inline_mode=inline_mode))
                 return
             ok = await execute_as_if_typed(adapter, update, f"/{spec.name}")
             if not ok:
-                await query.edit_message_text(
+                await _safe_edit(query, 
                     f"\u26A0\uFE0F Не удалось выполнить /{spec.name}. Попробуйте ещё раз.",
                     reply_markup=commands_inline_keyboard(spec.screen),
                 )
                 return
             # The agent's own reply arrives as a normal new message; leave the panel
             # message showing where we are, with nav back to the same command list.
-            await query.edit_message_text(
+            await _safe_edit(query, 
                 f"\u2705 Отправлено: /{spec.name}", reply_markup=commands_inline_keyboard(spec.screen),
             )
 
         async def _render_confirm(update: Update, command_name: str):
             spec = BY_NAME.get(command_name)
             if spec is None:
-                await update.callback_query.edit_message_text(
-                    "\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard())
+                await _safe_edit(update.callback_query, 
+                    "\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard(inline_mode=inline_mode))
                 return
             if inline_mode:
                 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -225,11 +240,11 @@ def register(ctx):
                     [InlineKeyboardButton(f"\u2705 Да, {spec.label}", callback_data=encode(MenuRoute(kind="execute", command=spec.name)))],
                     [InlineKeyboardButton("\u274C Отмена", callback_data=encode(MenuRoute(kind="cmdlist", screen=spec.screen)))],
                 ]
-                await update.callback_query.edit_message_text(
+                await _safe_edit(update.callback_query, 
                     confirm_prompt_text(spec), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows),
                 )
                 return
-            await update.callback_query.edit_message_text(
+            await _safe_edit(update.callback_query, 
                 confirm_prompt_text(spec), parse_mode="Markdown",
                 reply_markup=cmdlist_back_keyboard(spec.screen, []),
             )
@@ -242,7 +257,7 @@ def register(ctx):
             inline_kb, reply_kb = _resume_page_keyboard(rows, page, inline_mode=inline_mode)
             text = _resume_page_text(rows, page)
             if edit and update.callback_query:
-                await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=inline_kb)
+                await _safe_edit(update.callback_query, text, parse_mode="Markdown", reply_markup=inline_kb)
             else:
                 await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=inline_kb)
             if rows and reply_kb is not None:
@@ -273,12 +288,12 @@ def register(ctx):
                 await _render_root(update, edit=True)
             elif route.kind == "screen":
                 if route.screen not in SCREEN_TITLES:
-                    await query.edit_message_text("\u26A0\uFE0F Экран устарел.", reply_markup=root_keyboard())
+                    await _safe_edit(query, "\u26A0\uFE0F Экран устарел.", reply_markup=root_keyboard(inline_mode=inline_mode))
                     return
                 await _render_screen(update, route.screen, edit=True)
             elif route.kind == "cmdlist":
                 if route.screen not in SCREEN_TITLES:
-                    await query.edit_message_text("\u26A0\uFE0F Экран устарел.", reply_markup=root_keyboard())
+                    await _safe_edit(query, "\u26A0\uFE0F Экран устарел.", reply_markup=root_keyboard(inline_mode=inline_mode))
                     return
                 await _render_cmdlist(update, route.screen)
             elif route.kind == "resume_list":
@@ -294,7 +309,7 @@ def register(ctx):
             """Перехватывает кнопку CANCEL_TEXT до того, как она дойдёт до LLM как
             обычное сообщение (тот же hoisting-механизм, что и у CallbackQueryHandler)."""
             await update.effective_message.reply_text(
-                "Отменено. Ничего не выполнено.", reply_markup=root_keyboard(),
+                "Отменено. Ничего не выполнено.", reply_markup=root_keyboard(inline_mode=inline_mode),
             )
 
         native.add_handler(CommandHandler("menu", cmd_menu))

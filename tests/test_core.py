@@ -190,5 +190,40 @@ class TestDirectExecuteConfigGate(unittest.TestCase):
         self.assertFalse(inline_execute_allowed(FakeCtx()))
 
 
+class TestGridLayout(unittest.TestCase):
+    """Follow-up request: long command lists must be a compact 3-column grid,
+    not one button per row. screens/render.py imports the real `telegram`
+    SDK (only present in Hermes's own plugin venv, not this bare-Python test
+    run) as soon as any keyboard-building function executes — so only the
+    pure-Python `_grid` helper is exercised directly here; the routing
+    choice (inline_mode -> cmdlist vs screen) is covered structurally by
+    reading the source instead of executing it."""
+
+    def test_grid_chunks_into_threes(self):
+        import importlib.util
+        import pathlib
+        render_path = pathlib.Path(__file__).parent.parent / "screens" / "render.py"
+        spec = importlib.util.spec_from_file_location("_render_standalone", render_path)
+        # Can't exec the whole module (relative imports need the package), so
+        # pull just the _grid function's source and eval it in isolation.
+        src = render_path.read_text()
+        import re
+        match = re.search(r"def _grid\(.*?\n(?:    .*\n|\n)*", src)
+        self.assertIsNotNone(match, "_grid() not found in screens/render.py")
+        ns: dict = {"_GRID_COLUMNS": 3}
+        exec(match.group(0), ns)
+        _grid = ns["_grid"]
+        rows = _grid(list(range(7)), columns=3)
+        self.assertEqual([len(r) for r in rows], [3, 3, 1])
+
+    def test_root_keyboard_routes_differ_by_inline_mode(self):
+        """Source-level check (no SDK needed): the inline_mode branch must
+        target "cmdlist", the classic branch "screen" — this is the exact
+        fix for the extra confirmation tap the user asked to remove."""
+        import pathlib
+        src = (pathlib.Path(__file__).parent.parent / "screens" / "render.py").read_text()
+        self.assertIn('target_kind = "cmdlist" if inline_mode else "screen"', src)
+
+
 if __name__ == "__main__":
     unittest.main()

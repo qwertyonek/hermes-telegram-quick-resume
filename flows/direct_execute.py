@@ -50,14 +50,22 @@ def inline_execute_allowed(ctx) -> bool:
 
 async def execute_as_if_typed(adapter, update, command_text: str) -> bool:
     """Run *command_text* (e.g. "/restart") through the SAME path a real typed
-    Telegram message would take, using the chat/user identity from *update*
-    (the update that carried the inline-button tap).
+    Telegram message would take, using the REAL tapping user's identity —
+    not the panel message's (see below).
 
     Returns True if dispatched, False if the adapter/message shape didn't
     match what we expect (caller should fall back to showing the reply-
     keyboard button instead of silently doing nothing).
     """
     from gateway.platforms.event import MessageType
+
+    query = getattr(update, "callback_query", None)
+    tapping_user = getattr(query, "from_user", None) if query is not None else None
+    if tapping_user is None:
+        return False
+    tapping_user_id = str(getattr(tapping_user, "id", "")).strip()
+    if not tapping_user_id:
+        return False
 
     msg = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if msg is None:
@@ -68,19 +76,34 @@ async def execute_as_if_typed(adapter, update, command_text: str) -> bool:
         logger.warning("execute_as_if_typed: _build_message_event failed", exc_info=True)
         return False
 
-    # _build_message_event() takes the text from the ORIGINAL update (the
-    # callback's message, not the command) — override it with the command
-    # we actually want to run. allow_gateway_control defaults True on a
-    # fresh MessageEvent, which is exactly the bypass: this is what makes
-    # Hermes treat it as a real command instead of inert chat text.
+    # CRITICAL FIX: _build_message_event() derives user_id/user_name from
+    # msg.from_user — but *msg* here is the PANEL message (the one the
+    # inline keyboard is attached to), which Telegram reports as authored
+    # by THE BOT ITSELF, not the human who tapped. Left uncorrected, every
+    # authorization check below (and anything downstream keying off
+    # event.source.user_id) sees the bot's own id and is rightly refused.
+    # The real tapping user's identity lives on callback_query.from_user.
+    tapping_user_name = (
+        str(getattr(tapping_user, "username", "") or getattr(tapping_user, "full_name", "") or "").strip() or None
+    )
+    event.source.user_id = tapping_user_id
+    event.source.user_name = tapping_user_name
+    event.source.is_bot = bool(getattr(tapping_user, "is_bot", False))
+
+    # _build_message_event() also takes the text from the panel message —
+    # override it with the command we actually want to run.
+    # allow_gateway_control defaults True on a fresh MessageEvent, which is
+    # exactly the bypass: this is what makes Hermes treat it as a real
+    # command instead of inert chat text.
     event.text = command_text
 
-    # Re-run the same authorization check _handle_command() would have run
-    # on a typed message, using the real update's user — belt-and-braces,
-    # since _build_message_event() already derived identity from it, but an
-    # explicit recheck here keeps this module auditable on its own.
+    # Re-run the proper CALLBACK authorization check — not the plain-message
+    # one (that reads message.from_user, same bot-identity trap as above).
     try:
-        if not adapter._is_user_authorized_from_message(msg):
+        if not adapter._is_callback_user_authorized(
+            tapping_user_id, chat_id=str(event.source.chat_id), chat_type=event.source.chat_type,
+            thread_id=event.source.thread_id, user_name=tapping_user_name,
+        ):
             logger.warning("execute_as_if_typed: blocked unauthorized user for %r", command_text)
             return False
     except Exception:
