@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from ..registry.commands import ROOT_GRID, SCREEN_TITLES, commands_for_screen
+from ..registry.commands import ROOT_GRID, SCREEN_SESSIONS, SCREEN_TITLES, commands_for_screen
 from ..navigation.routes import MenuRoute, encode
 
 _ROWS_PER_PAGE_SESSIONS = 8
@@ -50,6 +50,8 @@ def screen_text(screen_id: str) -> str:
     emoji, title = SCREEN_TITLES[screen_id]
     cmds = commands_for_screen(screen_id)
     lines = [f"{emoji} *{title}*", ""]
+    if screen_id == SCREEN_SESSIONS:
+        lines.append("\u2022 \U0001F4DA Список сессий (карточки, без команд)")
     for c in cmds:
         suffix = " \u2699" if c.needs_argument else ""
         lines.append(f"\u2022 {c.label}{suffix}")
@@ -63,11 +65,14 @@ def screen_keyboard(screen_id: str):
     the reply-keyboard command buttons (flows/execute.py)."""
     from telegram import InlineKeyboardMarkup
 
-    rows = [
-        [_button("\u25B6\uFE0F Показать кнопки команд", MenuRoute(kind="cmdlist", screen=screen_id))],
-        [_button("\u2B05\uFE0F Назад", MenuRoute(kind="root"))],
-        [_button("\U0001F3E0 Главная", MenuRoute(kind="root"))],
-    ]
+    rows = []
+    if screen_id == SCREEN_SESSIONS:
+        # "Список сессий" is NOT a registry command — it opens the card UI
+        # (resume_list route) directly, same in classic and inline mode.
+        rows.append([_button("\U0001F4DA Список сессий", MenuRoute(kind="resume_list", page=0))])
+    rows.append([_button("\u25B6\uFE0F Показать кнопки команд", MenuRoute(kind="cmdlist", screen=screen_id))])
+    rows.append([_button("\u2B05\uFE0F Назад", MenuRoute(kind="root"))])
+    rows.append([_button("\U0001F3E0 Главная", MenuRoute(kind="root"))])
     return InlineKeyboardMarkup(rows)
 
 
@@ -90,12 +95,17 @@ def commands_inline_keyboard(screen_id: str):
     """All-inline command list (inline-execute mode, flows/direct_execute.py):
     safe commands become direct "execute" buttons in a compact 3-column
     grid; destructive ones still gate through "confirm" and get their own
-    full-width row (longer label, needs the room, and stands out as risky)."""
+    full-width row (longer label, needs the room, and stands out as risky).
+    "Список сессий" on the Sessions screen is special-cased: it is NOT a
+    registry command (there's no slash command to execute) — it opens the
+    session-card UI directly via the resume_list route."""
     from telegram import InlineKeyboardMarkup
 
     specs = commands_for_screen(screen_id)
     safe_buttons = []
     risky_rows = []
+    if screen_id == SCREEN_SESSIONS:
+        safe_buttons.append(_button("\U0001F4DA Список сессий", MenuRoute(kind="resume_list", page=0)))
     for c in specs:
         if c.destructive or c.confirm:
             risky_rows.append([_button(f"\u26A0\uFE0F {c.label}", MenuRoute(kind="confirm", command=c.name))])

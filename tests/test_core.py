@@ -37,6 +37,15 @@ class TestRegistryCoverage(unittest.TestCase):
             if c.destructive:
                 self.assertTrue(c.confirm or c.destructive, f"{c.name} is destructive but ungated")
 
+    def test_resume_and_sessions_are_not_registry_commands(self):
+        """Regression: both used to be plain CommandSpec entries, which routed
+        taps through the generic execute flow and sent the raw CLI text
+        ("📋 Named Sessions / 1. ... / 2. ...") straight to the user — exactly
+        the bug report this fixes. Both now live only in the session-card UI
+        (screens/render.py special-cases SCREEN_SESSIONS)."""
+        self.assertNotIn("resume", BY_NAME)
+        self.assertNotIn("sessions", BY_NAME)
+
     def test_coverage_matches_known_hermes_command_set(self):
         """Compares against the live /tmp/all_cmds.json snapshot taken from the
         installed Hermes during the audit (Фаза A). Skips gracefully if that
@@ -46,11 +55,11 @@ class TestRegistryCoverage(unittest.TestCase):
             self.skipTest("no live Hermes command snapshot available")
         all_known = set(json.load(open(snapshot_path, encoding="utf-8")))
         mine = set(BY_NAME.keys())
-        # meta/service (menu/qr/start), plus resume: its function is fully
-        # covered by the session-card UI (resume_list/execute routes call
-        # `/resume "<title>"` directly) so it no longer needs its own
-        # registry-driven button — see sessions.py + __init__.py's card flow.
-        excluded = {"menu", "qr", "start", "resume"}
+        # meta/service (menu/qr/start), plus resume/sessions: both are fully
+        # covered by the session-card UI (resume_list/session_card/execute
+        # routes), which calls `hermes sessions list`/`/resume "<title>"`
+        # directly — see sessions.py + __init__.py's card flow.
+        excluded = {"menu", "qr", "start", "resume", "sessions"}
         missing = all_known - mine - excluded
         self.assertEqual(missing, set(), f"commands missing from registry: {sorted(missing)}")
 

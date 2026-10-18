@@ -59,7 +59,6 @@ ROOT_GRID: list[str] = [
 COMMANDS: list[CommandSpec] = [
     # --- Сессии ---
     CommandSpec("new", "\u2728 Новая сессия", SCREEN_SESSIONS, test_status="verified_live"),
-    CommandSpec("sessions", "\U0001F4DA Список сессий", SCREEN_SESSIONS, test_status="manual"),
     CommandSpec("title", "\u270F\uFE0F Название", SCREEN_SESSIONS, needs_argument=True,
                 argument_hint="Допишите название после команды, например: /title Мой проект",
                 test_status="manual"),
