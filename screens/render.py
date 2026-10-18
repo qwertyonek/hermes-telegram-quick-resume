@@ -78,3 +78,21 @@ def cmdlist_back_keyboard(screen_id: str, confirm_specs=None):
     rows.append([_button("\u2B05\uFE0F Назад к разделу", MenuRoute(kind="screen", screen=screen_id))])
     rows.append([_button("\U0001F3E0 Главная", MenuRoute(kind="root"))])
     return InlineKeyboardMarkup(rows)
+
+
+def commands_inline_keyboard(screen_id: str):
+    """All-inline command list (used only when inline-execute is enabled, see
+    flows/direct_execute.py): safe commands become direct "execute" buttons,
+    destructive ones still gate through "confirm". No reply-keyboard at all."""
+    from telegram import InlineKeyboardMarkup
+
+    specs = commands_for_screen(screen_id)
+    rows = []
+    for c in specs:
+        if c.destructive or c.confirm:
+            rows.append([_button(f"\u26A0\uFE0F {c.label}", MenuRoute(kind="confirm", command=c.name))])
+        else:
+            rows.append([_button(c.label, MenuRoute(kind="execute", command=c.name))])
+    rows.append([_button("\u2B05\uFE0F Назад к разделу", MenuRoute(kind="screen", screen=screen_id))])
+    rows.append([_button("\U0001F3E0 Главная", MenuRoute(kind="root"))])
+    return InlineKeyboardMarkup(rows)

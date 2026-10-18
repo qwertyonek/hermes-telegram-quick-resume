@@ -74,6 +74,16 @@ class TestNavigationRoutes(unittest.TestCase):
         route = MenuRoute(kind="confirm", command="restart")
         self.assertEqual(decode(encode(route)), route)
 
+    def test_execute_roundtrip(self):
+        route = MenuRoute(kind="execute", command="status")
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_execute_resume_sentinel_roundtrip(self):
+        """Session-resume inline buttons stash an index, not a registry command
+        name — encode/decode must preserve that opaque payload byte-for-byte."""
+        route = MenuRoute(kind="execute", command="__resume__:3")
+        self.assertEqual(decode(encode(route)), route)
+
     def test_foreign_callback_data_is_none(self):
         """A callback from another plugin or core must decode to None, so our
         handler falls through instead of swallowing it (ТЗ §1.14, §5 test #3)."""
@@ -146,6 +156,38 @@ class TestSessionsParsing(unittest.TestCase):
         with mock.patch.object(sp, "run", side_effect=FileNotFoundError("hermes not found")):
             rows = list_telegram_sessions(limit=10)
         self.assertEqual(rows, [])
+
+
+class TestDirectExecuteConfigGate(unittest.TestCase):
+    """flows/direct_execute.py: the bypass stays opt-in (published-plugin safety
+    net) unless the user explicitly sets enable_inline_execute=true."""
+
+    def test_disabled_by_default(self):
+        from flows.direct_execute import inline_execute_allowed
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return default
+
+        self.assertFalse(inline_execute_allowed(FakeCtx()))
+
+    def test_enabled_when_config_true(self):
+        from flows.direct_execute import inline_execute_allowed
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                return True if key == "enable_inline_execute" else default
+
+        self.assertTrue(inline_execute_allowed(FakeCtx()))
+
+    def test_crashing_ctx_fails_closed(self):
+        from flows.direct_execute import inline_execute_allowed
+
+        class FakeCtx:
+            def get_config(self, key, default=None):
+                raise RuntimeError("boom")
+
+        self.assertFalse(inline_execute_allowed(FakeCtx()))
 
 
 if __name__ == "__main__":

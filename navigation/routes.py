@@ -41,6 +41,8 @@ def encode(route: MenuRoute) -> str:
         return f"{CB_PREFIX}resume:{route.page}"
     if route.kind == "confirm":
         return f"{CB_PREFIX}confirm:{route.command}"
+    if route.kind == "execute":
+        return f"{CB_PREFIX}x:{route.command}"
     raise ValueError(f"unknown route kind: {route.kind!r}")
 
 
@@ -64,4 +66,6 @@ def decode(data: str) -> MenuRoute | None:
             return MenuRoute(kind="resume_list", page=0)
     if body.startswith("confirm:"):
         return MenuRoute(kind="confirm", command=body[8:])
+    if body.startswith("x:"):
+        return MenuRoute(kind="execute", command=body[2:])
     return None

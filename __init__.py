@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import logging
 
+from .flows.direct_execute import execute_as_if_typed, inline_execute_allowed
 from .flows.execute import CANCEL_TEXT, commands_keyboard, confirm_keyboard, confirm_prompt_text
 from .navigation.routes import MenuRoute, decode, encode
 from .registry.commands import BY_NAME, SCREEN_TITLES, commands_for_screen
-from .screens.render import cmdlist_back_keyboard, root_keyboard, root_text, screen_keyboard, screen_text
+from .screens.render import (cmdlist_back_keyboard, commands_inline_keyboard, root_keyboard, root_text,
+                              screen_keyboard, screen_text)
 from .security.auth import is_authorized
 from .sessions import SessionRow, list_telegram_sessions
 
@@ -38,12 +40,36 @@ _RESUME_PAGE_SIZE = 8
 _NOT_AUTHORIZED_TEXT = "\u26D4 У вас нет доступа к этой панели."
 
 
-def _resume_page_keyboard(rows: list[SessionRow], page: int):
+def _resume_page_keyboard(rows: list[SessionRow], page: int, *, inline_mode: bool = False):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
     start = page * _RESUME_PAGE_SIZE
     page_rows = rows[start:start + _RESUME_PAGE_SIZE]
     total_pages = max(1, (len(rows) + _RESUME_PAGE_SIZE - 1) // _RESUME_PAGE_SIZE)
+
+    def _cmd_for(row: SessionRow) -> str:
+        safe_title = row.title.replace('"', '\\"')
+        return f'/resume "{safe_title}"'
+
+    if inline_mode:
+        # No ReplyKeyboardMarkup at all: each session is its own inline "execute"
+        # button (command stashed in callback_data, resolved to the real /resume
+        # text only inside _render_execute's lookup via BY_NAME... but /resume
+        # needs an arbitrary title, not a registry command name, so we encode
+        # the session index instead and resolve the title at dispatch time).
+        inline_rows = []
+        for idx, row in enumerate(page_rows):
+            inline_rows.append([InlineKeyboardButton(
+                row.title, callback_data=encode(MenuRoute(kind="execute", command=f"__resume__:{start + idx}")))])
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("\u2B05\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page - 1))))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=encode(MenuRoute(kind="resume_list", page=page))))
+        if start + _RESUME_PAGE_SIZE < len(rows):
+            nav_row.append(InlineKeyboardButton("\u27A1\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page + 1))))
+        inline_rows.append(nav_row)
+        inline_rows.append([InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))])
+        return InlineKeyboardMarkup(inline_rows), None
 
     # Navigation (inline, edits the panel message).
     nav_row = []
@@ -55,10 +81,6 @@ def _resume_page_keyboard(rows: list[SessionRow], page: int):
     inline_rows = [nav_row, [InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))]]
 
     # Execution (real reply-keyboard, one tap = real "/resume "<title>"" message).
-    def _cmd_for(row: SessionRow) -> str:
-        safe_title = row.title.replace('"', '\\"')
-        return f'/resume "{safe_title}"'
-
     reply_rows = [[KeyboardButton(_cmd_for(row))] for row in page_rows]
     reply_rows.append([KeyboardButton("/menu")])
 
@@ -93,6 +115,14 @@ def _handle_menu_command(raw_args: str, **kwargs):
 
 
 def register(ctx):
+    inline_mode = inline_execute_allowed(ctx)
+    if inline_mode:
+        logger.warning(
+            "hermes-telegram-control: INLINE EXECUTE ENABLED — bypassing "
+            "allow_gateway_control via adapter.handle_message(); see "
+            "flows/direct_execute.py for the exact mechanism and why."
+        )
+
     def _wire_telegram(native, adapter):
         """Фабрика, вызываемая один раз при connect(): native — живое PTB Application."""
         from telegram import Update
@@ -121,6 +151,15 @@ def register(ctx):
 
         async def _render_cmdlist(update: Update, screen_id: str):
             emoji, title = SCREEN_TITLES[screen_id]
+            if inline_mode:
+                # All-inline: safe commands execute directly via adapter.handle_message()
+                # bypass (flows/direct_execute.py); destructive ones still gate through confirm.
+                if update.callback_query:
+                    await update.callback_query.edit_message_text(
+                        f"{emoji} *{title}*", parse_mode="Markdown",
+                        reply_markup=commands_inline_keyboard(screen_id),
+                    )
+                return
             confirm_specs, reply_kb = commands_keyboard(screen_id)
             # Inline part: edit the panel message — nav back + "Подтвердить" gates
             # for any destructive command on this screen.
@@ -136,11 +175,59 @@ def register(ctx):
                 "Нажмите команду \U0001F447", reply_markup=reply_kb,
             )
 
+        async def _render_execute(update: Update, command_name: str):
+            """Inline-mode only: run *command_name* through the handle_message()
+            bypass using the SAME update that carried this callback tap."""
+            query = update.callback_query
+            if command_name.startswith("__resume__:"):
+                try:
+                    idx = int(command_name.split(":", 1)[1])
+                except ValueError:
+                    idx = -1
+                rows = list_telegram_sessions(limit=50)
+                if idx < 0 or idx >= len(rows):
+                    await query.edit_message_text("\u26A0\uFE0F Сессия устарела.", reply_markup=root_keyboard())
+                    return
+                safe_title = rows[idx].title.replace('"', '\\"')
+                ok = await execute_as_if_typed(adapter, update, f'/resume "{safe_title}"')
+                label = rows[idx].title
+                if not ok:
+                    await query.edit_message_text(f"\u26A0\uFE0F Не удалось открыть «{label}».", reply_markup=root_keyboard())
+                    return
+                await query.edit_message_text(f"\u2705 Открываю: {label}", reply_markup=root_keyboard())
+                return
+            spec = BY_NAME.get(command_name)
+            if spec is None:
+                await query.edit_message_text("\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard())
+                return
+            ok = await execute_as_if_typed(adapter, update, f"/{spec.name}")
+            if not ok:
+                await query.edit_message_text(
+                    f"\u26A0\uFE0F Не удалось выполнить /{spec.name}. Попробуйте ещё раз.",
+                    reply_markup=commands_inline_keyboard(spec.screen),
+                )
+                return
+            # The agent's own reply arrives as a normal new message; leave the panel
+            # message showing where we are, with nav back to the same command list.
+            await query.edit_message_text(
+                f"\u2705 Отправлено: /{spec.name}", reply_markup=commands_inline_keyboard(spec.screen),
+            )
+
         async def _render_confirm(update: Update, command_name: str):
             spec = BY_NAME.get(command_name)
             if spec is None:
                 await update.callback_query.edit_message_text(
                     "\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard())
+                return
+            if inline_mode:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                rows = [
+                    [InlineKeyboardButton(f"\u2705 Да, {spec.label}", callback_data=encode(MenuRoute(kind="execute", command=spec.name)))],
+                    [InlineKeyboardButton("\u274C Отмена", callback_data=encode(MenuRoute(kind="cmdlist", screen=spec.screen)))],
+                ]
+                await update.callback_query.edit_message_text(
+                    confirm_prompt_text(spec), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows),
+                )
                 return
             await update.callback_query.edit_message_text(
                 confirm_prompt_text(spec), parse_mode="Markdown",
@@ -152,13 +239,13 @@ def register(ctx):
 
         async def _render_resume(update: Update, page: int, *, edit: bool):
             rows = list_telegram_sessions(limit=50)
-            inline_kb, reply_kb = _resume_page_keyboard(rows, page)
+            inline_kb, reply_kb = _resume_page_keyboard(rows, page, inline_mode=inline_mode)
             text = _resume_page_text(rows, page)
             if edit and update.callback_query:
                 await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=inline_kb)
             else:
                 await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=inline_kb)
-            if rows:
+            if rows and reply_kb is not None:
                 await update.effective_chat.send_message("Нажмите сессию \U0001F447", reply_markup=reply_kb)
 
         async def cmd_menu(update: Update, context):
@@ -198,6 +285,10 @@ def register(ctx):
                 await _render_resume(update, route.page, edit=True)
             elif route.kind == "confirm":
                 await _render_confirm(update, route.command)
+            elif route.kind == "execute":
+                if not inline_mode:
+                    return  # execute routes only exist when inline-execute is on
+                await _render_execute(update, route.command)
 
         async def on_cancel_text(update: Update, context):
             """Перехватывает кнопку CANCEL_TEXT до того, как она дойдёт до LLM как
