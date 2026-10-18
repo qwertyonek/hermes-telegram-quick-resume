@@ -46,6 +46,33 @@ class TestRegistryCoverage(unittest.TestCase):
         self.assertNotIn("resume", BY_NAME)
         self.assertNotIn("sessions", BY_NAME)
 
+    def test_every_command_has_an_english_label(self):
+        """i18n follow-up: every button must translate, not just fall back
+        silently to Russian (a missing label_en is a content gap, not a bug,
+        but this test keeps new commands honest)."""
+        missing = [c.name for c in COMMANDS if not c.label_en]
+        self.assertEqual(missing, [], f"commands missing label_en: {missing}")
+
+    def test_label_for_falls_back_to_russian_without_en(self):
+        from registry.commands import CommandSpec
+        spec = CommandSpec(name="x", label="\u2728 Тест", screen="run")
+        self.assertEqual(spec.label_for("en"), "\u2728 Тест")
+        self.assertEqual(spec.label_for("ru"), "\u2728 Тест")
+
+    def test_label_for_uses_english_when_set(self):
+        from registry.commands import CommandSpec
+        spec = CommandSpec(name="x", label="\u2728 Тест", label_en="\u2728 Test", screen="run")
+        self.assertEqual(spec.label_for("en"), "\u2728 Test")
+        self.assertEqual(spec.label_for("ru"), "\u2728 Тест")
+
+    def test_screen_title_for_both_languages(self):
+        from registry.commands import SCREEN_SESSIONS, screen_title_for
+        emoji_ru, title_ru = screen_title_for(SCREEN_SESSIONS, "ru")
+        emoji_en, title_en = screen_title_for(SCREEN_SESSIONS, "en")
+        self.assertEqual(title_ru, "Сессии")
+        self.assertEqual(title_en, "Sessions")
+        self.assertEqual(emoji_ru, emoji_en)  # same icon both languages
+
     def test_coverage_matches_known_hermes_command_set(self):
         """Compares against the live /tmp/all_cmds.json snapshot taken from the
         installed Hermes during the audit (Фаза A). Skips gracefully if that
@@ -111,6 +138,10 @@ class TestNavigationRoutes(unittest.TestCase):
 
     def test_session_rename_roundtrip(self):
         route = MenuRoute(kind="session_rename", page=0)
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_lang_toggle_roundtrip(self):
+        route = MenuRoute(kind="lang_toggle")
         self.assertEqual(decode(encode(route)), route)
 
     def test_foreign_callback_data_is_none(self):

@@ -55,6 +55,8 @@ def encode(route: MenuRoute) -> str:
         return f"{CB_PREFIX}delok:{route.page}"
     if route.kind == "session_rename":
         return f"{CB_PREFIX}ren:{route.page}"
+    if route.kind == "lang_toggle":
+        return f"{CB_PREFIX}lang"
     raise ValueError(f"unknown route kind: {route.kind!r}")
 
 
@@ -100,4 +102,6 @@ def decode(data: str) -> MenuRoute | None:
             return MenuRoute(kind="session_rename", page=int(body[4:]))
         except ValueError:
             return None
+    if body == "lang":
+        return MenuRoute(kind="lang_toggle")
     return None
