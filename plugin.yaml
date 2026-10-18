@@ -1,0 +1,11 @@
+name: hermes-telegram-quick-resume
+version: "1.0.0"
+description: "Tap-to-resume Telegram menu for Hermes: inline-button session list (/menu, /qr), grouping every slash command (New / Resume / Stop / Model / ...) into a tappable category dashboard."
+author: QWERTYONEK
+license: MIT
+homepage: https://github.com/qwertyonek/hermes-telegram-quick-resume
+tags: [gateway, telegram, sessions, ui, menu]
+manifest_version: 2
+api_version: 1
+provides_hooks: []
+requires_hermes: ">=0.19"
