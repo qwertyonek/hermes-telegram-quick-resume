@@ -1,41 +1,50 @@
 ---
 name: quick-resume-tips
-description: "Explain the hermes-telegram-quick-resume plugin's /menu, /qr commands and reply-keyboard buttons when the user asks about them in Telegram."
-version: 1.0.0
+description: "Explain the hermes-telegram-quick-resume plugin's /menu control panel, navigation, and reply-keyboard execution when the user asks about them in Telegram."
+version: 2.0.0
 ---
 
-# Quick Resume — Telegram tap menu
+# Hermes Telegram Control — панель управления
 
-This plugin adds a tap-to-use menu on top of Hermes's existing Telegram gateway
-commands. It never replaces `/resume` or any built-in command — it just adds
-buttons that send the same commands for you.
+Полноценная русскоязычная панель на 8 разделов: Сессии, Выполнение, Модель,
+Статус, Автоматизация, Инструменты, Настройки, Система. Открывается `/menu`.
 
-## Commands it adds
+## Навигация vs выполнение (важно для объяснения пользователю)
 
-- `/menu` — opens the main menu: category buttons (Sessions, Run
-  control, Model & behavior, Status & usage, Automation, Skills &
-  maintenance, System) plus a direct "Resume a session" shortcut.
-- `/qr` — jumps straight to the tap-to-resume session list (same as tapping
-  "Resume a session" from `/menu`).
+- **Инлайн-кнопки** (прикреплены к сообщению панели) — только навигация:
+  "Назад", "Главная", переход между разделами. Тап редактирует то же
+  сообщение, ничего не отправляет и не выполняет.
+- **Reply-клавиатура** (внизу экрана, отдельное сообщение) — только здесь
+  реально отправляются команды. Подпись кнопки = точный текст команды, тап
+  = обычное сообщение от пользователя, Hermes обрабатывает его штатно.
 
-## How tapping actually runs a command
+Это два разных механизма Telegram, и смешивать их нельзя: reply-клавиатура
+не может быть прикреплена к `edit_message_text` (ограничение Bot API), а
+инлайн-кнопка физически не может "нажать" slash-команду программно (Hermes
+форсирует `allow_gateway_control=False` для любого инжектированного
+плагином сообщения — осознанная граница безопасности, не недоработка).
 
-Category and navigation buttons are Telegram inline buttons — they just edit
-the menu message, nothing executes. The final command buttons (session
-numbers, `/status`, `/model`, ...) are Telegram **reply-keyboard** buttons:
-tapping one sends that exact text as a genuine incoming message, exactly as
-if the user had typed `/resume 3` themselves. Hermes's normal command
-dispatcher authorizes and runs it — nothing is bypassed.
+## Опасные команды требуют подтверждения
 
-This two-tier design exists because Hermes's plugin API deliberately
-refuses to let a plugin execute a slash command programmatically
-(`ctx.inject_message` always sets `allow_gateway_control=False`) — a real
-security boundary, not a missing feature. Reply keyboards get the same
-one-tap feel without needing that permission at all.
+`/restart`, `/update`, `/rollback`, `/undo`, `/stop`, `/yolo` и другие
+деструктивные команды никогда не становятся прямой reply-кнопкой. Вместо
+этого — инлайн-кнопка "Подтвердить", которая открывает отдельный экран
+Да/Отмена. "Отмена" перехватывается плагином раньше, чем текст долетит до
+модели как обычное сообщение.
 
-## Category buttons are shortcuts, not new behavior
+## `/approve` и `/deny` — ограничение, не баг
 
-Every reply-keyboard button sends the bare slash command (e.g. tapping
-"/model" sends `/model`). Commands that need arguments still show their
-normal usage/picker after the tap — the button only saves typing the
-command name.
+У Hermes нет публичного API, который бы отдавал плагину ID конкретного
+pending-запроса подтверждения. Поэтому кнопки `/approve` и `/deny` в этом
+меню — без аргумента: они резолвят последний pending-запрос для этого
+чата, точно так же, как если бы пользователь набрал команду текстом без
+плагина. Подробности — `docs/menu-audit.md` в репозитории плагина.
+
+## Сессии — по названию, не по номеру
+
+Кнопки резюма сессии отправляют `/resume "Точное название"`, с пагинацией
+по 8 сессий на странице. Безымянные сессии (плейсхолдер "—" в
+`hermes sessions list`) исключены — иначе нумерация кнопок не совпадала бы
+с тем, что `/resume N` резолвит на самом деле (это была реальная причина
+бага на раннем прогоне: см. тест `test_em_dash_placeholder_row_is_filtered`
+в `tests/test_core.py`).

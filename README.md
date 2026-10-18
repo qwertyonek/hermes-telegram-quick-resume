@@ -1,46 +1,49 @@
-# Hermes Telegram Quick Resume
+# Hermes Telegram Control
 
 ![banner](assets/banner_with_text.jpg)
 
-A tap-to-use menu for Hermes Agent's Telegram gateway. Stop typing `/resume 3`
-— tap it instead.
+Полноценная русскоязычная панель управления для Telegram-гейтвея Hermes
+Agent. Один `/menu` открывает всё: 8 разделов, навигация кнопками,
+подтверждение для опасных команд, постраничный список сессий — без единой
+голой slash-команды для пользователя.
 
-## What it does
+## Что это даёт
 
-- **`/menu`** — a button dashboard: jump into a saved session, or browse
-  every built-in slash command grouped into 7 categories (Sessions, Run
-  control, Model & behavior, Status & usage, Automation, Skills &
-  maintenance, System).
-- **`/qr`** — straight to the tap-to-resume session list.
-- Tap a category → see what's in it → tap "Show tappable commands" → a row
-  of real buttons appears, one per command. Tap one and it sends.
+- **`/menu`** — главный экран с 8 разделами: Сессии, Выполнение, Модель,
+  Статус, Автоматизация, Инструменты, Настройки, Система.
+- **Навигация** — инлайн-кнопки "Назад"/"Главная" на каждом экране,
+  предсказуемый стек переходов (ТЗ-контракт: Назад ≠ откат действия).
+- **Выполнение команд** — реальные кнопки (reply-keyboard), тап отправляет
+  команду как обычное сообщение, Hermes обрабатывает её штатно.
+- **Подтверждение для опасных команд** (`/restart`, `/update`, `/rollback`,
+  `/undo`, `/stop`, `/yolo` и др.) — отдельный экран "Да/Отмена" перед
+  отправкой, кнопка "Отмена" гарантированно ничего не выполняет.
+- **Сессии по названию** — `/resume "Точное название"`, с пагинацией
+  (8 на странице), без путаницы безымянных/именованных сессий.
+- **67 команд** в едином реестре — полное покрытие, см.
+  `docs/menu-audit.md` за детальный разбор того, что проверено живьём и
+  что ограничено архитектурой Hermes.
 
-## How it actually works (and why)
+## Почему не всё работает "в один тап" — и как это сделано честно
 
-Telegram bots have two button systems:
+Hermes **намеренно** не даёт плагинам программно исполнять slash-команды
+(`ctx.inject_message` всегда форсирует `allow_gateway_control=False` —
+проверено в исходниках, не предположение). Это осознанная граница
+безопасности, а не недостаток плагина. Поэтому:
 
-- **Inline buttons** (`InlineKeyboardMarkup`) — attached to a specific
-  message, trigger a `callback_query` your bot code handles in Python.
-- **Reply keyboard buttons** (`ReplyKeyboardMarkup`) — shown above the
-  text input, and tapping one **sends its label as a normal text message**,
-  exactly as if the user typed it.
+- **Навигация** (переключение экранов) — инлайн-кнопки, ничего не
+  выполняют, только редактируют то же сообщение.
+- **Выполнение** — отдельная reply-клавиатура, где подпись кнопки
+  **буквально** текст команды. Тап = обычное сообщение от пользователя,
+  Hermes обрабатывает его так же, как если бы вы написали команду руками.
+- **`/approve`/`/deny`** — у Hermes нет публичного API для привязки к
+  конкретному pending-запросу, поэтому это кнопки без аргумента (резолвят
+  последний запрос штатно, как было бы без плагина).
+- **Toggle-статусы** (YOLO, голос, текущая модель) — Hermes не отдаёт их
+  плагину программно, поэтому мы не рисуем 🟢/⚪ там, где не можем проверить
+  факт — честнее показать команду без статуса, чем наврать.
 
-This plugin uses inline buttons only for *navigation* (open a category, go
-back) — nothing executes from an inline tap. The commands themselves
-(`/resume 3`, `/status`, `/model`, ...) are **reply-keyboard buttons**, so
-tapping one sends that exact text as a genuine incoming Telegram message.
-Hermes's own command dispatcher sees it, authorizes it, and runs it — the
-same path as if you'd typed it by hand.
-
-This is deliberate, not a workaround. Hermes's plugin API
-(`ctx.inject_message`) forces every plugin-injected message to
-`allow_gateway_control=False` (see `gateway/platforms/event.py`'s
-`get_command()`), so a plugin can never make a slash command execute
-programmatically — only hand conversational text to the LLM. That's a real
-security boundary: a plugin must never drive the gateway's control plane
-on a user's behalf without the user's own message hitting the wire. Reply
-keyboards respect that boundary completely while still feeling like a
-one-tap UI.
+Полный разбор каждого ограничения — `docs/menu-audit.md`.
 
 ## Install
 
@@ -49,40 +52,63 @@ hermes plugins install qwertyonek/hermes-telegram-quick-resume
 hermes plugins enable hermes-telegram-quick-resume
 ```
 
-Restart the gateway (`hermes gateway restart`) and send `/menu` to your bot.
-No config flags, no consent screens — every button just sends a plain
-message, same as typing.
+### Сократить стандартный список команд Telegram (опционально, ТЗ §6)
+
+Синяя кнопка "Menu" в Telegram не может исчезнуть (нативный UI-элемент), но
+список в ней можно сократить до `/menu` + `/help`:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      command_menu:
+        max_commands: 2
+        priority_mode: replace
+        priority:
+          - menu
+          - help
+```
+
+Это не отключает остальные 65 команд — они продолжают работать при наборе
+текстом, просто не висят в автокомплите `/`.
+
+Перезапустите гейтвей (`hermes gateway restart`) и отправьте `/menu` боту.
+
+## Тесты
+
+```bash
+python3 -m unittest tests.test_core -v
+```
+
+17 юнит-тестов: покрытие реестра команд (67/67), round-trip навигационных
+маршрутов, лимит 64 байта на callback_data, фильтрация безымянных сессий
+(регрессия на баг, найденный живым тестированием).
 
 ## Disclosure
 
-- **No network calls.** Everything runs locally against your own Hermes
-  gateway and Telegram bot connection.
-- **No credentials read.** The plugin never touches `.env`, `auth.json`, or
-  any token file — it only uses the public `ctx.register_telegram_handler`
-  and `ctx.register_command` plugin APIs.
-- **Reads your own session list** via the public `hermes sessions list`
-  CLI, scoped to the `telegram` source, to build the resume buttons.
+- **No network calls.** Всё работает локально против вашего Hermes-гейтвея.
+- **No credentials read.** Плагин не трогает `.env`, `auth.json` — только
+  публичные API `ctx.register_telegram_handler`, `ctx.register_command`.
+- **Читает список сессий** через публичный `hermes sessions list`.
+- **Проверяет допуск** через `TELEGRAM_ALLOWED_USERS` (та же переменная,
+  что использует сам гейтвей) — см. `security/auth.py`.
 - **No background processes, no telemetry, no self-update, no plugin
-  message injection.**
+  message injection** (намеренно — см. раздел выше).
 
-## How it works (for reviewers / contributors)
+## Структура (для ревьюеров)
 
-- `menu.py` — static data: command → category → button label. No framework
-  imports, safe to edit without touching the plugin's registration logic.
-- `sessions.py` — shells out to `hermes sessions list --source telegram`
-  (the same CLI a user runs) and parses the table into button rows. Never
-  reads `state.db` directly.
-- `__init__.py` — `register(ctx)` wires:
-  - `ctx.register_telegram_handler(factory)` → adds `/menu`, `/qr`
-    `CommandHandler`s and a prefix-scoped `CallbackQueryHandler` (`qr:...`)
-    to the live python-telegram-bot `Application`, so core's own button
-    handlers are untouched.
-  - `ctx.register_command("menu", ...)` → makes `/menu` discoverable outside
-    Telegram too (CLI, other gateways), falling back to plain text there.
-  - Every actual command send goes through `ReplyKeyboardMarkup` buttons
-    whose label IS the command text — Hermes never sees a difference
-    between that and the user typing it.
+```
+registry/commands.py    единый реестр: command -> screen -> metadata
+navigation/routes.py    callback_data <-> MenuRoute, без серверного state
+screens/render.py       текст+inline-клавиатура, только навигация
+flows/execute.py        ReplyKeyboardMarkup — единственное выполнение команд
+security/auth.py        допуск по TELEGRAM_ALLOWED_USERS
+sessions.py             чтение списка сессий через hermes sessions list
+__init__.py             register(ctx), склейка всего выше
+tests/test_core.py      17 юнит-тестов (registry/navigation/sessions)
+docs/menu-audit.md      детальный аудит ограничений API (Фаза A)
+```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE).
