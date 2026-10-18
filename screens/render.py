@@ -124,16 +124,20 @@ def screen_keyboard(screen_id: str, *, lang: str = "ru"):
     return InlineKeyboardMarkup(rows)
 
 
-def cmdlist_back_keyboard(screen_id: str, confirm_specs=None, *, lang: str = "ru"):
+def cmdlist_back_keyboard(screen_id: str, confirm_specs=None, arg_specs=None, *, lang: str = "ru"):
     """Inline nav + "Подтвердить"/"Confirm" rows for destructive commands
-    (ТЗ §4, §7): those never get a direct reply-keyboard send, only this
-    inline gate that opens the Да/Отмена confirm screen."""
+    (ТЗ §4, §7), plus argument-prompt rows for needs_argument commands
+    (fixes: a bare reply-keyboard tap used to send e.g. "/title" with no
+    argument at all) — both gate through inline buttons, never a direct
+    reply-keyboard send."""
     from telegram import InlineKeyboardMarkup
 
     rows = []
     for spec in confirm_specs or []:
         rows.append([_button(f"{_s(lang, 'confirm_prefix')}: {spec.label_for(lang)}",
                               MenuRoute(kind="confirm", command=spec.name))])
+    for spec in arg_specs or []:
+        rows.append([_button(spec.label_for(lang), MenuRoute(kind="arg_prompt", command=spec.name))])
     rows.append([_button(_s(lang, "back_to_section"), MenuRoute(kind="screen", screen=screen_id))])
     rows.append([_button(_s(lang, "home"), MenuRoute(kind="root"))])
     return InlineKeyboardMarkup(rows)
@@ -157,6 +161,11 @@ def commands_inline_keyboard(screen_id: str, *, lang: str = "ru"):
     for c in specs:
         if c.destructive or c.confirm:
             risky_rows.append([_button(f"\u26A0\uFE0F {c.label_for(lang)}", MenuRoute(kind="confirm", command=c.name))])
+        elif c.needs_argument:
+            # Needs a text argument (/title <name>, /bg <task>, ...) — can't be
+            # a direct execute button (there's nothing to send yet). Opens a
+            # ForceReply prompt instead (see __init__.py's _render_arg_prompt).
+            safe_buttons.append(_button(c.label_for(lang), MenuRoute(kind="arg_prompt", command=c.name)))
         else:
             safe_buttons.append(_button(c.label_for(lang), MenuRoute(kind="execute", command=c.name)))
     rows = _grid(safe_buttons) + risky_rows

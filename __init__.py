@@ -50,11 +50,12 @@ logger = logging.getLogger(__name__)
 _RESUME_PAGE_SIZE = 8
 _NOT_AUTHORIZED_TEXT = "\u26D4 У вас нет доступа к этой панели. / No access to this panel."
 _DEFAULT_LANG = "ru"
-# chat_id -> session_id awaiting a ForceReply rename answer. Module-level
-# (not per-handler-closure) since on_rename_reply and _render_session_rename_prompt
-# both need it; process-local and ephemeral by design — a restart just drops
-# any in-flight rename wizard, which is harmless (nothing destructive pending).
-_pending_rename: dict[int, str] = {}
+# chat_id -> ("rename", session_id) | ("cmd_arg", command_name), awaiting a
+# ForceReply answer. Module-level (not per-handler-closure) since
+# on_pending_reply and both _render_*_prompt functions need it; process-local
+# and ephemeral by design — a restart just drops any in-flight wizard, which
+# is harmless (nothing destructive pending, no slash command sent yet).
+_pending_input: dict[int, tuple[str, str]] = {}
 
 
 async def _safe_edit(query, text: str, **kwargs):
@@ -231,17 +232,18 @@ def register(ctx):
                         reply_markup=commands_inline_keyboard(screen_id, lang=lang),
                     )
                 return
-            confirm_specs, reply_kb = commands_keyboard(screen_id)
+            confirm_specs, arg_specs, reply_kb = commands_keyboard(screen_id)
             # Inline part: edit the panel message — nav back + "Подтвердить" gates
-            # for any destructive command on this screen.
+            # for any destructive command on this screen, plus argument-prompt
+            # buttons for needs_argument ones.
             if update.callback_query:
                 await _safe_edit(update.callback_query,
                     f"{emoji} *{title}* \u2014 кнопки команд ниже \U0001F447",
-                    parse_mode="Markdown", reply_markup=cmdlist_back_keyboard(screen_id, confirm_specs, lang=lang),
+                    parse_mode="Markdown", reply_markup=cmdlist_back_keyboard(screen_id, confirm_specs, arg_specs, lang=lang),
                 )
             # Reply-keyboard part: a NEW message, since ReplyKeyboardMarkup cannot
             # attach to edit_message_text (Telegram Bot API constraint). Only
-            # non-destructive commands are real buttons here.
+            # non-destructive, no-argument commands are real buttons here.
             await update.effective_chat.send_message(
                 "Нажмите команду \U0001F447", reply_markup=reply_kb,
             )
@@ -387,7 +389,7 @@ def register(ctx):
                 return
             row = rows[idx]
             chat_id = update.effective_chat.id
-            _pending_rename[chat_id] = row.session_id
+            _pending_input[chat_id] = ("rename", row.session_id)
             prompt = (f"\u270F\uFE0F Enter a new title for «{row.title}»:"
                       if lang == "en" else f"\u270F\uFE0F Введите новое название для «{row.title}»:")
             placeholder = "New title" if lang == "en" else "Новое название"
@@ -395,36 +397,83 @@ def register(ctx):
                 prompt, reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
             )
 
-        async def on_rename_reply(update: Update, context):
-            from telegram.ext import ApplicationHandlerStop
-            from .sessions import rename_session
+        async def _render_arg_prompt(update: Update, command_name: str):
+            """ForceReply for a needs_argument command (/title, /bg, /goal, ...)
+            tapped from the inline command list — the ORIGINAL bug this fixes:
+            a bare tap used to fire e.g. "/title" with no argument at all,
+            which Hermes then treats as a usage query, not a rename."""
+            from telegram import ForceReply
+            lang = _lang_for(update.effective_chat.id)
+            query = update.callback_query
+            spec = BY_NAME.get(command_name)
+            if spec is None:
+                await _safe_edit(query, "\u26A0\uFE0F Команда устарела.", reply_markup=root_keyboard(inline_mode=inline_mode, lang=lang))
+                return
             chat_id = update.effective_chat.id
-            if chat_id not in _pending_rename:
-                return  # not a rename reply — not ours, let it fall through
+            _pending_input[chat_id] = ("cmd_arg", command_name)
+            hint = spec.argument_hint_for(lang)
+            prompt = (f"\u270F\uFE0F *{spec.label_for(lang)}*\n\n{hint}" if hint
+                       else f"\u270F\uFE0F *{spec.label_for(lang)}*\n\n"
+                            + ("Type the argument and send it:" if lang == "en" else "Напишите аргумент и отправьте:"))
+            placeholder = "Argument" if lang == "en" else "Аргумент"
+            await update.effective_chat.send_message(
+                prompt, parse_mode="Markdown",
+                reply_markup=ForceReply(selective=True, input_field_placeholder=placeholder),
+            )
+
+        async def on_pending_reply(update: Update, context):
+            """Handles whatever text answers a ForceReply prompt: either a
+            session rename or a command argument. Raises ApplicationHandlerStop
+            after handling — see module docstring on why that's required (PTB
+            still runs later handler groups on the same update otherwise)."""
+            from telegram.ext import ApplicationHandlerStop
+            chat_id = update.effective_chat.id
+            if chat_id not in _pending_input:
+                return  # not a pending reply — not ours, let it fall through
             if not is_authorized(_user_id(update)):
                 return  # fail closed; don't consume someone else's pending state
             lang = _lang_for(chat_id)
-            session_id = _pending_rename.pop(chat_id)
-            new_title = (update.effective_message.text or "").strip()
-            if not new_title:
-                empty_msg = "\u26A0\uFE0F Title cannot be empty." if lang == "en" else "\u26A0\uFE0F Название не может быть пустым."
+            kind, payload = _pending_input.pop(chat_id)
+            answer = (update.effective_message.text or "").strip()
+            if not answer:
+                empty_msg = "\u26A0\uFE0F Cannot be empty." if lang == "en" else "\u26A0\uFE0F Нельзя оставить пустым."
                 await update.effective_message.reply_text(empty_msg)
-                # STOP here too: this text answered our ForceReply prompt, it
-                # must never also reach core's catch-all as ordinary chat input.
                 raise ApplicationHandlerStop
-            ok = rename_session(session_id, new_title)
-            if ok:
-                done = f"\u2705 Renamed: «{new_title}»" if lang == "en" else f"\u2705 Переименовано: «{new_title}»"
-                await update.effective_message.reply_text(done, reply_markup=root_keyboard(inline_mode=inline_mode, lang=lang))
-            else:
-                fail = "\u26A0\uFE0F Rename failed." if lang == "en" else "\u26A0\uFE0F Не удалось переименовать."
-                await update.effective_message.reply_text(fail)
-            # CRITICAL: without this, PTB still runs group=0 handlers (core's
-            # catch-all text handler) on the SAME update — the rename reply
-            # text would also be dispatched as if the user had typed it as a
-            # normal chat message (visible symptom: it looked exactly like
-            # typing "/title <text>" straight into the agent). Raising here
-            # is the only way to stop cross-group dispatch in PTB.
+
+            if kind == "rename":
+                from .sessions import rename_session
+                ok = rename_session(payload, answer)
+                if ok:
+                    done = f"\u2705 Renamed: «{answer}»" if lang == "en" else f"\u2705 Переименовано: «{answer}»"
+                    await update.effective_message.reply_text(done, reply_markup=root_keyboard(inline_mode=inline_mode, lang=lang))
+                else:
+                    fail = "\u26A0\uFE0F Rename failed." if lang == "en" else "\u26A0\uFE0F Не удалось переименовать."
+                    await update.effective_message.reply_text(fail)
+            elif kind == "cmd_arg":
+                spec = BY_NAME.get(payload)
+                if spec is None:
+                    raise ApplicationHandlerStop
+                command_text = f"/{spec.name} {answer}"
+                if inline_mode:
+                    ok = await execute_as_if_typed(adapter, update, command_text)
+                    if ok:
+                        done = f"\u2705 Sent: {command_text}" if lang == "en" else f"\u2705 Отправлено: {command_text}"
+                        await update.effective_message.reply_text(done, reply_markup=root_keyboard(inline_mode=inline_mode, lang=lang))
+                    else:
+                        fail = f"\u26A0\uFE0F Failed to run {command_text}." if lang == "en" else f"\u26A0\uFE0F Не удалось выполнить {command_text}."
+                        await update.effective_message.reply_text(fail)
+                else:
+                    # Classic mode: no handle_message() bypass available — the
+                    # honest path is a single real reply-keyboard button whose
+                    # label IS the full command+argument text (same contract
+                    # as flows/execute.py's direct buttons).
+                    from telegram import KeyboardButton, ReplyKeyboardMarkup
+                    reply_kb = ReplyKeyboardMarkup(
+                        [[KeyboardButton(command_text)], [KeyboardButton("/menu")]],
+                        resize_keyboard=True, one_time_keyboard=True,
+                    )
+                    tap_prompt = f"\u25B6\uFE0F Tap to send: {command_text}" if lang == "en" else f"\u25B6\uFE0F Нажмите, чтобы отправить: {command_text}"
+                    await update.effective_message.reply_text(tap_prompt, reply_markup=reply_kb)
             raise ApplicationHandlerStop
 
         async def on_lang_toggle(update: Update):
@@ -484,6 +533,8 @@ def register(ctx):
                 await _render_session_delete_confirm(update, route.page)
             elif route.kind == "session_rename":
                 await _render_session_rename_prompt(update, route.page)
+            elif route.kind == "arg_prompt":
+                await _render_arg_prompt(update, route.command)
 
         async def on_cancel_text(update: Update, context):
             """Перехватывает кнопку CANCEL_TEXT до того, как она дойдёт до LLM как
@@ -498,12 +549,11 @@ def register(ctx):
         native.add_handler(CommandHandler("menu", cmd_menu))
         native.add_handler(CallbackQueryHandler(on_callback, pattern="^qr:"))
         native.add_handler(TgMessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), on_cancel_text))
-        # Reply to a ForceReply rename prompt (group=-1-equivalent: registered
-        # before the Regex handler so a "^{CANCEL_TEXT}$" collision is impossible
-        # — the rename text can never equal CANCEL_TEXT since they're disjoint
-        # UI flows). on_rename_reply no-ops (falls through) when chat_id isn't
-        # in _pending_rename, so it never swallows ordinary chat text.
-        native.add_handler(TgMessageHandler(filters.TEXT & ~filters.COMMAND, on_rename_reply), group=-1)
+        # Reply to a ForceReply prompt (rename or command argument). Registered
+        # in a group earlier than core's own catch-all text handler so it gets
+        # first look; on_pending_reply no-ops (falls through) when chat_id
+        # isn't in _pending_input, so it never swallows ordinary chat text.
+        native.add_handler(TgMessageHandler(filters.TEXT & ~filters.COMMAND, on_pending_reply), group=-1)
         logger.info("hermes-telegram-control: /menu wired (navigation+execution split, i18n ru/en)")
 
     ctx.register_telegram_handler(_wire_telegram)

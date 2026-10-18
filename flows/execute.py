@@ -19,22 +19,27 @@ from ..registry.commands import CommandSpec, commands_for_screen
 CANCEL_TEXT = "\u274C Отмена"
 
 
-def commands_keyboard(screen_id: str) -> tuple[list[CommandSpec], object]:
-    """Returns (destructive_specs, reply_markup). ``destructive_specs`` is the
-    subset of this screen's commands that need the confirm flow instead of a
-    direct button — the caller renders an inline "Подтвердить" row for each
-    alongside this reply keyboard, since both can't live on one message
-    (reply keyboards attach to messages, inline keyboards too, but a single
-    Telegram message carries only ONE of the two kinds at once)."""
+def commands_keyboard(screen_id: str) -> tuple[list[CommandSpec], list[CommandSpec], object]:
+    """Returns (destructive_specs, arg_specs, reply_markup). ``destructive_specs``
+    needs the confirm flow; ``arg_specs`` needs a ForceReply argument prompt
+    (see __init__.py's _render_arg_prompt) — neither gets a direct
+    reply-keyboard button, since a bare tap on either would either skip
+    confirmation or silently send the command with no argument at all (the
+    ORIGINAL bug report this fixes: "Название" button fired bare /title).
+    The caller renders inline rows for both alongside this reply keyboard,
+    since both can't live on one message (reply keyboards attach to
+    messages, inline keyboards too, but a single Telegram message carries
+    only ONE of the two kinds at once)."""
     from telegram import KeyboardButton, ReplyKeyboardMarkup
 
     specs = commands_for_screen(screen_id)
-    direct = [c for c in specs if not (c.destructive or c.confirm)]
+    direct = [c for c in specs if not (c.destructive or c.confirm or c.needs_argument)]
     needs_confirm = [c for c in specs if c.destructive or c.confirm]
+    needs_arg = [c for c in specs if c.needs_argument and not (c.destructive or c.confirm)]
 
     rows = [[KeyboardButton(f"/{c.name}")] for c in direct]
     rows.append([KeyboardButton("/menu")])
-    return needs_confirm, ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+    return needs_confirm, needs_arg, ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
 def confirm_keyboard(command_name: str):

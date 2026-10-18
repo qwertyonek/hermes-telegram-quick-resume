@@ -144,6 +144,10 @@ class TestNavigationRoutes(unittest.TestCase):
         route = MenuRoute(kind="lang_toggle")
         self.assertEqual(decode(encode(route)), route)
 
+    def test_arg_prompt_roundtrip(self):
+        route = MenuRoute(kind="arg_prompt", command="title")
+        self.assertEqual(decode(encode(route)), route)
+
     def test_foreign_callback_data_is_none(self):
         """A callback from another plugin or core must decode to None, so our
         handler falls through instead of swallowing it (ТЗ §1.14, §5 test #3)."""
@@ -329,6 +333,40 @@ class TestGridLayout(unittest.TestCase):
         import pathlib
         src = (pathlib.Path(__file__).parent.parent / "screens" / "render.py").read_text()
         self.assertIn('target_kind = "cmdlist" if inline_mode else "screen"', src)
+
+
+class TestArgPromptWiring(unittest.TestCase):
+    """Regression: a needs_argument command (title/bg/btw/goal/subgoal/loop/
+    plan/moa/learn) must NEVER become a direct execute/reply-keyboard button
+    — a bare tap used to fire e.g. "/title" with no argument at all. Both
+    commands_inline_keyboard (source-level, SDK not available in this test
+    env) and flows.execute.commands_keyboard route them through arg_prompt
+    instead."""
+
+    def test_needs_argument_commands_excluded_from_direct_reply_buttons(self):
+        """Mirrors flows/execute.py's commands_keyboard() filtering logic
+        directly (that module needs the real `telegram` package via a
+        relative import that only resolves inside the installed plugin
+        package, not this bare test run)."""
+        from registry.commands import SCREEN_RUN, commands_for_screen
+        specs = commands_for_screen(SCREEN_RUN)
+        direct = [c for c in specs if not (c.destructive or c.confirm or c.needs_argument)]
+        arg_specs = [c for c in specs if c.needs_argument and not (c.destructive or c.confirm)]
+        arg_names = {c.name for c in arg_specs}
+        self.assertIn("bg", arg_names)
+        self.assertIn("btw", arg_names)
+        self.assertIn("steer", arg_names)
+        direct_names = {c.name for c in direct}
+        self.assertNotIn("bg", direct_names)
+        self.assertNotIn("btw", direct_names)
+        self.assertNotIn("steer", direct_names)
+
+    def test_commands_inline_keyboard_routes_arg_commands_through_arg_prompt(self):
+        """Source-level check (no SDK needed): screens/render.py must route
+        needs_argument commands to the arg_prompt MenuRoute kind, not execute."""
+        import pathlib
+        src = (pathlib.Path(__file__).parent.parent / "screens" / "render.py").read_text()
+        self.assertIn('MenuRoute(kind="arg_prompt", command=c.name)', src)
 
 
 if __name__ == "__main__":

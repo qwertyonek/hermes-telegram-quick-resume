@@ -57,6 +57,8 @@ def encode(route: MenuRoute) -> str:
         return f"{CB_PREFIX}ren:{route.page}"
     if route.kind == "lang_toggle":
         return f"{CB_PREFIX}lang"
+    if route.kind == "arg_prompt":
+        return f"{CB_PREFIX}arg:{route.command}"
     raise ValueError(f"unknown route kind: {route.kind!r}")
 
 
@@ -104,4 +106,6 @@ def decode(data: str) -> MenuRoute | None:
             return None
     if body == "lang":
         return MenuRoute(kind="lang_toggle")
+    if body.startswith("arg:"):
+        return MenuRoute(kind="arg_prompt", command=body[4:])
     return None
