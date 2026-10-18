@@ -14,6 +14,7 @@ class SessionRow:
     title: str
     preview: str
     last_active: str
+    session_id: str = ""
 
 
 _ROW_RE = re.compile(
@@ -55,6 +56,7 @@ def list_telegram_sessions(limit: int = 10, timeout: float = 10.0) -> list[Sessi
             title=title,
             preview=m.group("preview").strip(),
             last_active=m.group("last_active").strip(),
+            session_id=m.group("id").strip(),
         ))
     return rows
 
@@ -67,3 +69,31 @@ def format_session_label(row: SessionRow, max_len: int = 42) -> str:
     if len(base) > max_len:
         base = base[: max_len - 1].rstrip() + "\u2026"
     return base
+
+
+def delete_session(session_id: str, timeout: float = 10.0) -> bool:
+    """Shell out to ``hermes sessions delete <id> --yes`` (same public CLI a
+    user would run by hand). Returns True on success."""
+    try:
+        proc = subprocess.run(
+            ["hermes", "sessions", "delete", session_id, "--yes"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def rename_session(session_id: str, new_title: str, timeout: float = 10.0) -> bool:
+    """Shell out to ``hermes sessions rename <id> <title...>``. Returns True on success."""
+    new_title = (new_title or "").strip()
+    if not new_title:
+        return False
+    try:
+        proc = subprocess.run(
+            ["hermes", "sessions", "rename", session_id, new_title],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0

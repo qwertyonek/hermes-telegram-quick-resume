@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 _RESUME_PAGE_SIZE = 8
 _NOT_AUTHORIZED_TEXT = "\u26D4 У вас нет доступа к этой панели."
+# chat_id -> session_id awaiting a ForceReply rename answer. Module-level
+# (not per-handler-closure) since on_rename_reply and _render_session_rename_prompt
+# both need it; process-local and ephemeral by design — a restart just drops
+# any in-flight rename wizard, which is harmless (nothing destructive pending).
+_pending_rename: dict[int, str] = {}
 
 
 async def _safe_edit(query, text: str, **kwargs):
@@ -55,66 +60,65 @@ async def _safe_edit(query, text: str, **kwargs):
         raise
 
 
-def _resume_page_keyboard(rows: list[SessionRow], page: int, *, inline_mode: bool = False):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+def _session_list_keyboard(rows: list[SessionRow]):
+    """Flat list of session-title buttons — PURE NAVIGATION (ТЗ §1.12): each
+    tap opens that session's card (session_card route), never resumes
+    directly. Works identically in classic and inline-execute mode since
+    this is navigation, not execution — no reply-keyboard needed here."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    start = page * _RESUME_PAGE_SIZE
-    page_rows = rows[start:start + _RESUME_PAGE_SIZE]
-    total_pages = max(1, (len(rows) + _RESUME_PAGE_SIZE - 1) // _RESUME_PAGE_SIZE)
-
-    def _cmd_for(row: SessionRow) -> str:
-        safe_title = row.title.replace('"', '\\"')
-        return f'/resume "{safe_title}"'
-
-    if inline_mode:
-        # No ReplyKeyboardMarkup at all: each session is its own inline "execute"
-        # button (command stashed in callback_data, resolved to the real /resume
-        # text only inside _render_execute's lookup via BY_NAME... but /resume
-        # needs an arbitrary title, not a registry command name, so we encode
-        # the session index instead and resolve the title at dispatch time).
-        inline_rows = []
-        for idx, row in enumerate(page_rows):
-            inline_rows.append([InlineKeyboardButton(
-                row.title, callback_data=encode(MenuRoute(kind="execute", command=f"__resume__:{start + idx}")))])
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton("\u2B05\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page - 1))))
-        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=encode(MenuRoute(kind="resume_list", page=page))))
-        if start + _RESUME_PAGE_SIZE < len(rows):
-            nav_row.append(InlineKeyboardButton("\u27A1\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page + 1))))
-        inline_rows.append(nav_row)
-        inline_rows.append([InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))])
-        return InlineKeyboardMarkup(inline_rows), None
-
-    # Navigation (inline, edits the panel message).
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("\u2B05\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page - 1))))
-    nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=encode(MenuRoute(kind="resume_list", page=page))))
-    if start + _RESUME_PAGE_SIZE < len(rows):
-        nav_row.append(InlineKeyboardButton("\u27A1\uFE0F", callback_data=encode(MenuRoute(kind="resume_list", page=page + 1))))
-    inline_rows = [nav_row, [InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))]]
-
-    # Execution (real reply-keyboard, one tap = real "/resume "<title>"" message).
-    reply_rows = [[KeyboardButton(_cmd_for(row))] for row in page_rows]
-    reply_rows.append([KeyboardButton("/menu")])
-
-    return InlineKeyboardMarkup(inline_rows), ReplyKeyboardMarkup(reply_rows, resize_keyboard=True, one_time_keyboard=True)
+    rows_kb = []
+    for idx, row in enumerate(rows):
+        rows_kb.append([InlineKeyboardButton(
+            f"{idx + 1}. {row.title}", callback_data=encode(MenuRoute(kind="session_card", page=idx)))])
+    rows_kb.append([InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))])
+    return InlineKeyboardMarkup(rows_kb)
 
 
-def _resume_page_text(rows: list[SessionRow], page: int) -> str:
+def _session_list_text(rows: list[SessionRow]) -> str:
     if not rows:
         return ("\U0001F4AC *Сессии*\n\nНазванных сессий пока нет.\n"
                 "Используйте /title, чтобы назвать текущую сессию, потом возвращайтесь сюда.")
-    start = page * _RESUME_PAGE_SIZE
-    page_rows = rows[start:start + _RESUME_PAGE_SIZE]
-    lines = ["\U0001F4AC *Сохранённые сессии*", ""]
-    for row in page_rows:
-        preview = f" \u2014 _{row.preview}_" if row.preview else ""
-        lines.append(f"\u2022 {row.title}{preview} ({row.last_active})")
-    lines.append("")
-    lines.append("Нажмите кнопку снизу, чтобы вернуться в сессию \U0001F447")
+    return "\U0001F4AC *Сохранённые сессии*\n\nВыберите сессию \U0001F447"
+
+
+def _session_card_text(row: SessionRow) -> str:
+    lines = [f"\U0001F4AC *{row.title}*", ""]
+    if row.preview:
+        lines.append(f"_{row.preview}_")
+        lines.append("")
+    lines.append(f"Последняя активность: {row.last_active}")
+    lines.append(f"ID: `{row.session_id}`")
     return "\n".join(lines)
+
+
+def _session_card_keyboard(idx: int, *, inline_mode: bool):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    top_row = []
+    if inline_mode:
+        # Resume needs the handle_message() bypass (flows/direct_execute.py) —
+        # only available in inline-execute mode. Classic mode's "Войти" button
+        # is a real reply-keyboard /resume button instead (see _render_session_card).
+        top_row.append(InlineKeyboardButton("\u25B6\uFE0F Войти", callback_data=encode(MenuRoute(kind="execute", command=f"__resume__:{idx}"))))
+    top_row.append(InlineKeyboardButton("\u270F\uFE0F Переименовать", callback_data=encode(MenuRoute(kind="session_rename", page=idx))))
+    rows = [
+        top_row,
+        [InlineKeyboardButton("\U0001F5D1 Удалить", callback_data=encode(MenuRoute(kind="session_delete", page=idx)))],
+        [InlineKeyboardButton("\u2B05\uFE0F К списку", callback_data=encode(MenuRoute(kind="resume_list", page=0))),
+         InlineKeyboardButton("\U0001F3E0 Главная", callback_data=encode(MenuRoute(kind="root")))],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _session_delete_confirm_keyboard(idx: int):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    rows = [
+        [InlineKeyboardButton("\u2705 Да, удалить", callback_data=encode(MenuRoute(kind="session_delete_confirm", page=idx))),
+         InlineKeyboardButton("\u274C Отмена", callback_data=encode(MenuRoute(kind="session_card", page=idx)))],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _handle_menu_command(raw_args: str, **kwargs):
@@ -207,7 +211,7 @@ def register(ctx):
                 ok = await execute_as_if_typed(adapter, update, f'/resume "{safe_title}"')
                 label = rows[idx].title
                 if not ok:
-                    await _safe_edit(query, f"\u26A0\uFE0F Не удалось открыть «{label}».", reply_markup=root_keyboard(inline_mode=inline_mode))
+                    await _safe_edit(query, f"\u26A0\uFE0F Не удалось открыть «{label}».", reply_markup=_session_card_keyboard(idx, inline_mode=inline_mode))
                     return
                 await _safe_edit(query, f"\u2705 Открываю: {label}", reply_markup=root_keyboard(inline_mode=inline_mode))
                 return
@@ -254,14 +258,98 @@ def register(ctx):
 
         async def _render_resume(update: Update, page: int, *, edit: bool):
             rows = list_telegram_sessions(limit=50)
-            inline_kb, reply_kb = _resume_page_keyboard(rows, page, inline_mode=inline_mode)
-            text = _resume_page_text(rows, page)
+            kb = _session_list_keyboard(rows)
+            text = _session_list_text(rows)
             if edit and update.callback_query:
-                await _safe_edit(update.callback_query, text, parse_mode="Markdown", reply_markup=inline_kb)
+                await _safe_edit(update.callback_query, text, parse_mode="Markdown", reply_markup=kb)
             else:
-                await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=inline_kb)
-            if rows and reply_kb is not None:
-                await update.effective_chat.send_message("Нажмите сессию \U0001F447", reply_markup=reply_kb)
+                await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+        async def _render_session_card(update: Update, idx: int):
+            query = update.callback_query
+            rows = list_telegram_sessions(limit=50)
+            if idx < 0 or idx >= len(rows):
+                await _safe_edit(query, "\u26A0\uFE0F Сессия устарела.", reply_markup=_session_list_keyboard(rows))
+                return
+            row = rows[idx]
+            await _safe_edit(query, _session_card_text(row), parse_mode="Markdown",
+                              reply_markup=_session_card_keyboard(idx, inline_mode=inline_mode))
+            if not inline_mode:
+                # Classic mode: "Войти" has to be a real reply-keyboard button
+                # (same honesty contract as commands_keyboard) since there is
+                # no handle_message() bypass available here.
+                from telegram import KeyboardButton, ReplyKeyboardMarkup
+                safe_title = row.title.replace('"', '\\"')
+                reply_kb = ReplyKeyboardMarkup(
+                    [[KeyboardButton(f'/resume "{safe_title}"')], [KeyboardButton("/menu")]],
+                    resize_keyboard=True, one_time_keyboard=True,
+                )
+                await update.effective_chat.send_message(
+                    f"\u25B6\uFE0F Нажмите, чтобы войти в «{row.title}»", reply_markup=reply_kb,
+                )
+
+        async def _render_session_delete(update: Update, idx: int):
+            query = update.callback_query
+            rows = list_telegram_sessions(limit=50)
+            if idx < 0 or idx >= len(rows):
+                await _safe_edit(query, "\u26A0\uFE0F Сессия устарела.", reply_markup=_session_list_keyboard(rows))
+                return
+            row = rows[idx]
+            await _safe_edit(
+                query, f"\u26A0\uFE0F Удалить «{row.title}»? Это действие НЕОБРАТИМО.",
+                reply_markup=_session_delete_confirm_keyboard(idx),
+            )
+
+        async def _render_session_delete_confirm(update: Update, idx: int):
+            from .sessions import delete_session
+            query = update.callback_query
+            rows = list_telegram_sessions(limit=50)
+            if idx < 0 or idx >= len(rows):
+                await _safe_edit(query, "\u26A0\uFE0F Сессия устарела.", reply_markup=_session_list_keyboard(rows))
+                return
+            row = rows[idx]
+            ok = delete_session(row.session_id)
+            if not ok:
+                await _safe_edit(query, f"\u26A0\uFE0F Не удалось удалить «{row.title}».",
+                                  reply_markup=_session_card_keyboard(idx, inline_mode=inline_mode))
+                return
+            rows_after = list_telegram_sessions(limit=50)
+            await _safe_edit(query, f"\u2705 Удалено: «{row.title}»\n\n" + _session_list_text(rows_after),
+                              parse_mode="Markdown", reply_markup=_session_list_keyboard(rows_after))
+
+        async def _render_session_rename_prompt(update: Update, idx: int):
+            from telegram import ForceReply
+            query = update.callback_query
+            rows = list_telegram_sessions(limit=50)
+            if idx < 0 or idx >= len(rows):
+                await _safe_edit(query, "\u26A0\uFE0F Сессия устарела.", reply_markup=_session_list_keyboard(rows))
+                return
+            row = rows[idx]
+            chat_id = update.effective_chat.id
+            _pending_rename[chat_id] = row.session_id
+            await update.effective_chat.send_message(
+                f"\u270F\uFE0F Введите новое название для «{row.title}»:",
+                reply_markup=ForceReply(selective=True, input_field_placeholder="Новое название"),
+            )
+
+        async def on_rename_reply(update: Update, context):
+            from .sessions import rename_session
+            chat_id = update.effective_chat.id
+            if chat_id not in _pending_rename:
+                return  # not a rename reply — not ours, let it fall through
+            if not is_authorized(_user_id(update)):
+                return  # fail closed; don't consume someone else's pending state
+            session_id = _pending_rename.pop(chat_id)
+            new_title = (update.effective_message.text or "").strip()
+            if not new_title:
+                await update.effective_message.reply_text("\u26A0\uFE0F Название не может быть пустым.")
+                return
+            ok = rename_session(session_id, new_title)
+            if ok:
+                await update.effective_message.reply_text(f"\u2705 Переименовано: «{new_title}»",
+                                                            reply_markup=root_keyboard(inline_mode=inline_mode))
+            else:
+                await update.effective_message.reply_text("\u26A0\uFE0F Не удалось переименовать.")
 
         async def cmd_menu(update: Update, context):
             if not is_authorized(_user_id(update)):
@@ -304,6 +392,14 @@ def register(ctx):
                 if not inline_mode:
                     return  # execute routes only exist when inline-execute is on
                 await _render_execute(update, route.command)
+            elif route.kind == "session_card":
+                await _render_session_card(update, route.page)
+            elif route.kind == "session_delete":
+                await _render_session_delete(update, route.page)
+            elif route.kind == "session_delete_confirm":
+                await _render_session_delete_confirm(update, route.page)
+            elif route.kind == "session_rename":
+                await _render_session_rename_prompt(update, route.page)
 
         async def on_cancel_text(update: Update, context):
             """Перехватывает кнопку CANCEL_TEXT до того, как она дойдёт до LLM как
@@ -315,6 +411,12 @@ def register(ctx):
         native.add_handler(CommandHandler("menu", cmd_menu))
         native.add_handler(CallbackQueryHandler(on_callback, pattern="^qr:"))
         native.add_handler(TgMessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), on_cancel_text))
+        # Reply to a ForceReply rename prompt (group=-1-equivalent: registered
+        # before the Regex handler so a "^{CANCEL_TEXT}$" collision is impossible
+        # — the rename text can never equal CANCEL_TEXT since they're disjoint
+        # UI flows). on_rename_reply no-ops (falls through) when chat_id isn't
+        # in _pending_rename, so it never swallows ordinary chat text.
+        native.add_handler(TgMessageHandler(filters.TEXT & ~filters.COMMAND, on_rename_reply), group=-1)
         logger.info("hermes-telegram-control: /menu wired (navigation+execution split)")
 
     ctx.register_telegram_handler(_wire_telegram)

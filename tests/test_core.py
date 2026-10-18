@@ -46,7 +46,11 @@ class TestRegistryCoverage(unittest.TestCase):
             self.skipTest("no live Hermes command snapshot available")
         all_known = set(json.load(open(snapshot_path, encoding="utf-8")))
         mine = set(BY_NAME.keys())
-        excluded = {"menu", "qr", "start"}  # meta/service, deliberately not in registry
+        # meta/service (menu/qr/start), plus resume: its function is fully
+        # covered by the session-card UI (resume_list/execute routes call
+        # `/resume "<title>"` directly) so it no longer needs its own
+        # registry-driven button — see sessions.py + __init__.py's card flow.
+        excluded = {"menu", "qr", "start", "resume"}
         missing = all_known - mine - excluded
         self.assertEqual(missing, set(), f"commands missing from registry: {sorted(missing)}")
 
@@ -82,6 +86,22 @@ class TestNavigationRoutes(unittest.TestCase):
         """Session-resume inline buttons stash an index, not a registry command
         name — encode/decode must preserve that opaque payload byte-for-byte."""
         route = MenuRoute(kind="execute", command="__resume__:3")
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_session_card_roundtrip(self):
+        route = MenuRoute(kind="session_card", page=5)
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_session_delete_roundtrip(self):
+        route = MenuRoute(kind="session_delete", page=2)
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_session_delete_confirm_roundtrip(self):
+        route = MenuRoute(kind="session_delete_confirm", page=2)
+        self.assertEqual(decode(encode(route)), route)
+
+    def test_session_rename_roundtrip(self):
+        route = MenuRoute(kind="session_rename", page=0)
         self.assertEqual(decode(encode(route)), route)
 
     def test_foreign_callback_data_is_none(self):
@@ -124,6 +144,13 @@ class TestSessionsParsing(unittest.TestCase):
         self.assertEqual(m.group("title").strip(), "HERMES_SETUP")
         self.assertEqual(m.group("preview").strip(), "привет бро")
 
+    def test_row_regex_captures_session_id(self):
+        """Regression: SessionRow.session_id must be populated — delete/rename
+        act on the opaque ID, not the human title (titles aren't unique)."""
+        line = "HERMES_SETUP                     привет бро                               51m ago       20261018_153825_959624c4"
+        m = _ROW_RE.match(line)
+        self.assertEqual(m.group("id"), "20261018_153825_959624c4")
+
     def test_em_dash_placeholder_row_is_filtered(self):
         """This is the exact bug report: an untitled session showed as a numbered
         button with no real title, and the numbering didn't match /resume N."""
@@ -156,6 +183,45 @@ class TestSessionsParsing(unittest.TestCase):
         with mock.patch.object(sp, "run", side_effect=FileNotFoundError("hermes not found")):
             rows = list_telegram_sessions(limit=10)
         self.assertEqual(rows, [])
+
+    def test_delete_session_calls_cli_with_yes_flag(self):
+        import unittest.mock as mock
+        import subprocess as sp
+        from sessions import delete_session
+
+        fake_proc = mock.Mock(returncode=0)
+        with mock.patch.object(sp, "run", return_value=fake_proc) as mocked:
+            ok = delete_session("20261018_153825_959624c4")
+        self.assertTrue(ok)
+        args = mocked.call_args[0][0]
+        self.assertEqual(args, ["hermes", "sessions", "delete", "20261018_153825_959624c4", "--yes"])
+
+    def test_delete_session_failure_returns_false(self):
+        import unittest.mock as mock
+        import subprocess as sp
+        from sessions import delete_session
+
+        fake_proc = mock.Mock(returncode=1)
+        with mock.patch.object(sp, "run", return_value=fake_proc):
+            ok = delete_session("bad-id")
+        self.assertFalse(ok)
+
+    def test_rename_session_calls_cli_with_title(self):
+        import unittest.mock as mock
+        import subprocess as sp
+        from sessions import rename_session
+
+        fake_proc = mock.Mock(returncode=0)
+        with mock.patch.object(sp, "run", return_value=fake_proc) as mocked:
+            ok = rename_session("20261018_153825_959624c4", "Новое имя")
+        self.assertTrue(ok)
+        args = mocked.call_args[0][0]
+        self.assertEqual(args, ["hermes", "sessions", "rename", "20261018_153825_959624c4", "Новое имя"])
+
+    def test_rename_session_rejects_empty_title(self):
+        from sessions import rename_session
+        self.assertFalse(rename_session("some-id", "   "))
+        self.assertFalse(rename_session("some-id", ""))
 
 
 class TestDirectExecuteConfigGate(unittest.TestCase):

@@ -23,8 +23,12 @@ CB_PREFIX = "qr:"
 
 @dataclass(frozen=True)
 class MenuRoute:
-    """One navigable screen. ``page`` is used by paginated lists (sessions)."""
-    kind: str                 # "root" | "screen" | "cmdlist" | "resume_list" | "confirm"
+    """One navigable screen. ``page`` doubles as: pagination page number for
+    "resume_list"; the FLAT session index (not page-relative) for every
+    "session_*" card-flow route below — see __init__.py's _render_session_card
+    for why a flat index instead of a per-page one."""
+    kind: str                 # "root"|"screen"|"cmdlist"|"resume_list"|"confirm"|"execute"
+                               # |"session_card"|"session_delete"|"session_delete_confirm"|"session_rename"
     screen: str = ""           # registry screen id, empty for root
     page: int = 0
     command: str = ""          # for "confirm": which command needs Да/Отмена
@@ -43,6 +47,14 @@ def encode(route: MenuRoute) -> str:
         return f"{CB_PREFIX}confirm:{route.command}"
     if route.kind == "execute":
         return f"{CB_PREFIX}x:{route.command}"
+    if route.kind == "session_card":
+        return f"{CB_PREFIX}card:{route.page}"
+    if route.kind == "session_delete":
+        return f"{CB_PREFIX}del:{route.page}"
+    if route.kind == "session_delete_confirm":
+        return f"{CB_PREFIX}delok:{route.page}"
+    if route.kind == "session_rename":
+        return f"{CB_PREFIX}ren:{route.page}"
     raise ValueError(f"unknown route kind: {route.kind!r}")
 
 
@@ -68,4 +80,24 @@ def decode(data: str) -> MenuRoute | None:
         return MenuRoute(kind="confirm", command=body[8:])
     if body.startswith("x:"):
         return MenuRoute(kind="execute", command=body[2:])
+    if body.startswith("card:"):
+        try:
+            return MenuRoute(kind="session_card", page=int(body[5:]))
+        except ValueError:
+            return None
+    if body.startswith("delok:"):
+        try:
+            return MenuRoute(kind="session_delete_confirm", page=int(body[6:]))
+        except ValueError:
+            return None
+    if body.startswith("del:"):
+        try:
+            return MenuRoute(kind="session_delete", page=int(body[4:]))
+        except ValueError:
+            return None
+    if body.startswith("ren:"):
+        try:
+            return MenuRoute(kind="session_rename", page=int(body[4:]))
+        except ValueError:
+            return None
     return None
