@@ -396,6 +396,7 @@ def register(ctx):
             )
 
         async def on_rename_reply(update: Update, context):
+            from telegram.ext import ApplicationHandlerStop
             from .sessions import rename_session
             chat_id = update.effective_chat.id
             if chat_id not in _pending_rename:
@@ -408,7 +409,9 @@ def register(ctx):
             if not new_title:
                 empty_msg = "\u26A0\uFE0F Title cannot be empty." if lang == "en" else "\u26A0\uFE0F Название не может быть пустым."
                 await update.effective_message.reply_text(empty_msg)
-                return
+                # STOP here too: this text answered our ForceReply prompt, it
+                # must never also reach core's catch-all as ordinary chat input.
+                raise ApplicationHandlerStop
             ok = rename_session(session_id, new_title)
             if ok:
                 done = f"\u2705 Renamed: «{new_title}»" if lang == "en" else f"\u2705 Переименовано: «{new_title}»"
@@ -416,6 +419,13 @@ def register(ctx):
             else:
                 fail = "\u26A0\uFE0F Rename failed." if lang == "en" else "\u26A0\uFE0F Не удалось переименовать."
                 await update.effective_message.reply_text(fail)
+            # CRITICAL: without this, PTB still runs group=0 handlers (core's
+            # catch-all text handler) on the SAME update — the rename reply
+            # text would also be dispatched as if the user had typed it as a
+            # normal chat message (visible symptom: it looked exactly like
+            # typing "/title <text>" straight into the agent). Raising here
+            # is the only way to stop cross-group dispatch in PTB.
+            raise ApplicationHandlerStop
 
         async def on_lang_toggle(update: Update):
             new_lang = _toggle_lang(update.effective_chat.id)
@@ -478,10 +488,12 @@ def register(ctx):
         async def on_cancel_text(update: Update, context):
             """Перехватывает кнопку CANCEL_TEXT до того, как она дойдёт до LLM как
             обычное сообщение (тот же hoisting-механизм, что и у CallbackQueryHandler)."""
+            from telegram.ext import ApplicationHandlerStop
             lang = _lang_for(update.effective_chat.id)
             await update.effective_message.reply_text(
                 "Отменено. Ничего не выполнено.", reply_markup=root_keyboard(inline_mode=inline_mode, lang=lang),
             )
+            raise ApplicationHandlerStop  # same cross-group leak this fixes for on_rename_reply
 
         native.add_handler(CommandHandler("menu", cmd_menu))
         native.add_handler(CallbackQueryHandler(on_callback, pattern="^qr:"))
